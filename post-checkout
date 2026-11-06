@@ -1,0 +1,6 @@
+#!/bin/sh
+# ERP Doctor quick check after a branch switch (local only, not committed).
+# $3 = 1 on branch checkout, 0 on file checkout. Never blocks git.
+[ "$3" = "1" ] || exit 0
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:/Users/User/tools/erp-doctor/doctor.ps1" -Quick -Repo "$(pwd -W)"
+exit 0
