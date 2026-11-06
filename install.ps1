@@ -50,24 +50,49 @@ $projects = @()
 if (Test-Path $projectsFile) {
     $projects = @(Get-Content $projectsFile | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
 }
+function Show-Projects {
+    Write-Host ''
+    Write-Host '=== Projects that doctor will check ===' -ForegroundColor Cyan
+    if ($projects.Count -eq 0) {
+        Write-Host '  (none yet)'
+    } else {
+        $n = 1
+        foreach ($p in $projects) { Write-Host "  $n. $p  [$(Get-ProjectType $p)]"; $n++ }
+    }
+    Write-Host ''
+}
+
+Show-Projects
+if ($projects.Count -eq 0) {
+    Write-Host 'Add your backend (Laravel) and frontend (React) folders now.' -ForegroundColor Yellow
+}
+Write-Host 'Do you want to ADD another project to this list?'
+Write-Host '  YES -> type its FULL folder path, e.g.  C:\xampp\htdocs\my-app'
+Write-Host '         (tip: you can drag the folder from File Explorer into this window)'
+Write-Host '  NO  -> just press ENTER'
 Write-Host ''
-if ($projects.Count -gt 0) {
-    Write-Host 'Projects already registered:'
-    foreach ($p in $projects) { Write-Host "  $p  [$(Get-ProjectType $p)]" }
-} else {
-    Write-Host 'No projects registered yet.'
-}
-Write-Host 'Add your backend (Laravel) and frontend (React) folders. Press Enter on an empty line when done.'
 while ($true) {
-    $answer = (Read-Host 'Project folder').Trim().Trim('"')
+    $answer = (Read-Host 'Add project (ENTER = no, continue)').Trim().Trim('"')
     if (-not $answer) { break }
+    if ($answer -notmatch '^[A-Za-z]:\\|^\\\\') {
+        Write-Host "  '$answer' is not a folder path. Type the FULL path starting with the drive, like C:\..., or press ENTER." -ForegroundColor Yellow
+        continue
+    }
+    if (-not (Test-Path $answer)) {
+        Write-Host "  folder not found: $answer" -ForegroundColor Yellow
+        continue
+    }
     $type = Get-ProjectType $answer
-    if (-not $type) { Write-Host "  not a Laravel/React project: $answer" -ForegroundColor Yellow; continue }
+    if (-not $type) {
+        Write-Host "  not a Laravel project (no artisan) or React project (no react in package.json): $answer" -ForegroundColor Yellow
+        continue
+    }
     $full = (Resolve-Path $answer).Path.TrimEnd('\')
-    if ($projects -contains $full) { Write-Host '  already registered'; continue }
+    if ($projects -contains $full) { Write-Host '  already in the list - it will be checked.' -ForegroundColor Green; continue }
     $projects += $full
-    Write-Host "  added [$type]"
+    Write-Host "  added [$type]" -ForegroundColor Green
 }
+Show-Projects
 Set-Content $projectsFile ($projects) -Encoding UTF8
 
 # ---------------------------------------------------------------- 3. git hooks
@@ -117,4 +142,17 @@ foreach ($p in $projects) {
 }
 
 Write-Host ''
-Write-Host 'Done. Close ALL open terminals (and restart Claude Code), then type: doctor' -ForegroundColor Green
+Write-Host 'Install done.' -ForegroundColor Green
+
+# ---------------------------------------------------------------- 4. test it right away
+if ($projects.Count -gt 0) {
+    Write-Host ''
+    $run = (Read-Host 'Test it now on all your projects? Nothing will be changed. (ENTER = yes, n = no)').Trim()
+    if ($run -notmatch '^[nN]') {
+        & (Join-Path $dir 'doctor.ps1') -All -NoFix
+    }
+}
+
+Write-Host ''
+Write-Host 'From now on: close this window, open a NEW terminal, and type:  doctor' -ForegroundColor Green
+Write-Host '(in Claude Code type:  !doctor)' -ForegroundColor Green

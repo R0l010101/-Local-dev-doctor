@@ -6,10 +6,15 @@ Windows only (PowerShell 5.1, built into Windows).
 
 ## Install (once)
 
-1. Copy or clone this folder anywhere, e.g. `C:\Users\<you>\tools\Local-dev-doctor`.
+1. Copy or clone this folder anywhere, e.g. `C:\Users\<you>\tools\dev-doctor`.
 2. **Double-click `install.cmd`.**
-3. When asked, type your project folders one per line (backend and frontend), then press Enter on an empty line.
-4. Close all open terminals (and restart Claude Code).
+3. It shows the list of **projects doctor will check**. Then it asks `Add project (ENTER = no, continue)`:
+   - **First time (list is empty):** type the **full path** of your backend folder, press Enter, then your frontend folder, press Enter. You can also drag the folder from File Explorer into the window.
+   - **Already in the list?** Just press **Enter**. Don't type names like `erp` or `backend`; it only accepts full paths like `C:\xampp\htdocs\erp`.
+4. It asks `Test it now on all your projects?`. Press **Enter** to run doctor right away (report only, nothing is changed).
+5. Close all open terminals (and restart Claude Code).
+
+Run `install.cmd` again any time to add another project. It is safe to run more than once.
 
 ## Use
 
@@ -102,6 +107,14 @@ Tuwing magpapalit ka ng branch (`git checkout`), kusa itong magche-check. **Wala
 
 ### Paano gamitin
 
-1. **I-install (isang beses):** i-double-click ang `install.cmd`, ilagay ang folder ng backend at frontend mo, tapos Enter sa blangkong linya.
-2. **Gamitin:** i-type ang `doctor` sa kahit anong terminal (sa Claude Code: `!doctor`).
-3. **Basahin:** `[OK]` = maayos. `[FIX]` = naayos na. `[WARN]`/`[FAIL]` = sundin ang nakasulat.
+1. **I-install (isang beses):** i-double-click ang `install.cmd`.
+2. **Ang listahan ng project:** ipapakita nito ang `Projects that doctor will check`, ang mga project na susuriin.
+   - **Unang beses (walang laman ang listahan):** i-type ang **buong path** ng backend folder mo at pindutin ang Enter, tapos ang frontend folder. Puwede mo ring i-drag ang folder mula sa File Explorer papunta sa window.
+   - **Nasa listahan na?** Pindutin lang ang **Enter**. Huwag mag-type ng `erp` o `backend`; buong path lang ang tinatanggap, halimbawa `C:\xampp\htdocs\erp`.
+3. **I-test agad:** kapag tinanong ang `Test it now on all your projects?`, pindutin ang **Enter**. Patatakbuhin nito ang doctor sa lahat ng project mo. Report lang ito at walang babaguhin.
+4. **Isara lahat ng terminal** at magbukas ng bago.
+5. **Gamitin:** i-type ang `doctor` sa kahit anong terminal (sa Claude Code: `!doctor`).
+   - Sa loob ng BE o FE folder, iyon lang ang susuriin. Kahit saan pa, susuriin ang lahat. `doctor -All` para laging lahat.
+6. **Basahin:** `[OK]` = maayos. `[FIX]` = naayos na. `[WARN]`/`[FAIL]` = sundin ang nakasulat.
+
+Para magdagdag ng project sa susunod, i-double-click ulit ang `install.cmd`. Ligtas itong ulitin.
