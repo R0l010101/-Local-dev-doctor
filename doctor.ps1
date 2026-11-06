@@ -1,40 +1,42 @@
 <#
-  Doctor - health check for a local Laravel dev setup. Detects each developer's own setup
-  (PHP, MySQL/MariaDB, web server) instead of assuming fixed paths, and fixes missing files.
+  Local Dev Doctor - health check for local Laravel (backend) and React (frontend) projects.
+  Detects each developer's own setup instead of assuming fixed paths, and fixes missing files.
 
   Usage:
-    doctor            full check, auto-fixes the safe things
+    doctor            inside a project folder: check that project
+                      anywhere else: check every project listed in projects.txt
+    doctor -All       check every project in projects.txt
     doctor -NoFix     report only, change nothing
     doctor -Quick     file checks only, prints nothing when all OK (used by the git hook)
-    doctor -Repo X    check another project
-                      (default: the current folder if it has artisan, else C:\xampp1\htdocs\erp)
+    doctor -Path X    check the project at X
 
   Optional override: set DOCTOR_PHP to the php.exe to use.
 
-  Auto-fixes (never deletes, never overwrites):
-    - .env missing                -> copy .env.example
-    - .env line without # or =    -> add '#'   (backup .env.bak-<stamp>)
-    - core config/<name>.php gone -> restore from git, or copy its single template
-                                     (<name>_*.php, <name>.example.php, <name>.php.example, <name>.php.dist)
+  Laravel auto-fixes (never deletes, never overwrites):
+    - .env missing -> copy .env.example;  .env line without # or = -> add '#' (backup first)
+    - core config/<name>.php missing -> restore from git, or copy its single template
+      (<name>_*.php, <name>.example.php, <name>.php.example, <name>.php.dist)
     - storage / bootstrap\cache folders missing -> create
     - stale bootstrap cache (classes that don't exist) -> move to bootstrap\cache\_stale\<stamp>
-  Report only: vendor, APP_KEY, Passport keys, PHP version, database server, web server.
+  React auto-fixes:
+    - no env file at all -> copy the template (.env.example, .env.development.copy, ...)
+  Everything else (PHP, Node, database, servers, packages) is reported with the command to run.
 #>
 param(
-    [string]$Repo,
+    [Alias('Repo')][string]$Path,
+    [switch]$All,
     [switch]$NoFix,
     [switch]$Quick
 )
 
-if (-not $Repo) {
-    if (Test-Path (Join-Path (Get-Location).Path 'artisan')) { $Repo = (Get-Location).Path }
-    else { $Repo = 'C:\xampp1\htdocs\erp' }
-}
-$Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$ToolDir      = $PSScriptRoot
+$ProjectsFile = Join-Path $ToolDir 'projects.txt'
+$Stamp        = Get-Date -Format 'yyyyMMdd-HHmmss'
 
-$results = New-Object System.Collections.ArrayList
+# ================================================================ helpers
+
 function Add-Result($status, $name, $msg) {
-    [void]$results.Add([pscustomobject]@{ Status = $status; Name = $name; Msg = $msg })
+    [void]$script:results.Add([pscustomobject]@{ Status = $status; Name = $name; Msg = $msg })
 }
 
 function Get-EnvValue($lines, $key) {
@@ -42,6 +44,41 @@ function Get-EnvValue($lines, $key) {
         if ($l -match "^\s*$key\s*=\s*(.*?)\s*$") { return $Matches[1].Trim('"', "'") }
     }
     return $null
+}
+
+function Get-ProjectType($dir) {
+    if (-not $dir -or -not (Test-Path $dir)) { return $null }
+    if (Test-Path (Join-Path $dir 'artisan')) { return 'Laravel' }
+    $pkgPath = Join-Path $dir 'package.json'
+    if (Test-Path $pkgPath) {
+        $pkg = Get-Content $pkgPath -Raw | ConvertFrom-Json
+        if (($pkg.dependencies -and $pkg.dependencies.react) -or ($pkg.devDependencies -and $pkg.devDependencies.react)) { return 'React' }
+    }
+    return $null
+}
+
+# Port -> listening process, built once.
+$script:listeners = $null
+function Get-Listener($port) {
+    if ($null -eq $script:listeners) {
+        $script:listeners = @{}
+        foreach ($c in @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue)) {
+            if (-not $script:listeners.ContainsKey([int]$c.LocalPort)) {
+                $script:listeners[[int]$c.LocalPort] = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    if ($script:listeners.ContainsKey([int]$port)) { return $script:listeners[[int]$port] }
+    return $null
+}
+function Test-Listening($port) {
+    Get-Listener $port | Out-Null
+    return $script:listeners.ContainsKey([int]$port)
+}
+
+function Get-ListenPorts($procId) {
+    @(Get-NetTCPConnection -OwningProcess $procId -State Listen -ErrorAction SilentlyContinue |
+      Select-Object -ExpandProperty LocalPort -Unique | Sort-Object)
 }
 
 # Run php.exe with only its own folder on PATH (mixing two PHP installs' DLLs breaks extensions).
@@ -60,153 +97,140 @@ function Invoke-Php($exe, [string[]]$phpArgs) {
     return @{ Out = $out; Code = $code }
 }
 
-function Get-ListenPorts($procId) {
-    @(Get-NetTCPConnection -OwningProcess $procId -State Listen -ErrorAction SilentlyContinue |
-      Select-Object -ExpandProperty LocalPort -Unique | Sort-Object)
-}
+# ================================================================ LARAVEL
 
-if (-not (Test-Path (Join-Path $Repo 'artisan'))) {
-    Write-Host "Not a Laravel project (no artisan): $Repo" -ForegroundColor Red; exit 1
-}
-
-# ================================================================ FILE CHECKS (also run by -Quick)
-
-# ---------------------------------------------------------------- .env
-$envPath = Join-Path $Repo '.env'
-$envExample = Join-Path $Repo '.env.example'
-if (-not (Test-Path $envPath)) {
-    if ((Test-Path $envExample) -and -not $NoFix) {
-        Copy-Item $envExample $envPath
-        Add-Result 'FIX' '.env' 'was missing - copied from .env.example. Fill in your DB settings, then: php artisan key:generate'
-    } else {
-        Add-Result 'FAIL' '.env' 'missing (copy .env.example to .env and fill it in)'
-    }
-}
-$envLines = @()
-if (Test-Path $envPath) {
-    $bytes  = [IO.File]::ReadAllBytes($envPath)
-    $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
-    $text   = (New-Object Text.UTF8Encoding $false).GetString($bytes)
-    if ($hasBom) { $text = $text.Substring(1) }
-    $lines = $text -split "`n"                 # each line keeps its trailing `r
-    $bad = @()
-    for ($i = 0; $i -lt $lines.Length; $i++) {
-        $t = $lines[$i].Trim()
-        if ($t -ne '' -and -not $t.StartsWith('#') -and -not $t.Contains('=')) { $bad += $i }
-    }
-    if ($bad.Count -gt 0) {
-        $desc = ($bad | ForEach-Object { "line $($_ + 1): `"$($lines[$_].Trim())`"" }) -join '; '
-        if ($NoFix) {
-            Add-Result 'FAIL' '.env' "missing # on $desc"
+function Test-Laravel {
+    # ------------------------------------------------------------ .env
+    $envPath = Join-Path $Repo '.env'
+    $envExample = Join-Path $Repo '.env.example'
+    $envFixed = $false
+    if (-not (Test-Path $envPath)) {
+        if ((Test-Path $envExample) -and -not $NoFix) {
+            Copy-Item $envExample $envPath
+            Add-Result 'FIX' '.env' 'was missing - copied from .env.example. Fill in your DB settings, then: php artisan key:generate'
+            $envFixed = $true
         } else {
-            Copy-Item $envPath "$envPath.bak-$Stamp"
-            foreach ($i in $bad) { $lines[$i] = '# ' + $lines[$i].TrimStart() }
-            [IO.File]::WriteAllText($envPath, ($lines -join "`n"), (New-Object Text.UTF8Encoding $hasBom))
-            Add-Result 'FIX' '.env' "added # to $desc (backup .env.bak-$Stamp)"
+            Add-Result 'FAIL' '.env' 'missing (copy .env.example to .env and fill it in)'
         }
-    } elseif (@($results | Where-Object { $_.Name -eq '.env' }).Count -eq 0) {
-        Add-Result 'OK' '.env' 'present, no broken lines'
     }
-    $envLines = Get-Content $envPath
-}
-
-# ---------------------------------------------------------------- core config files
-$coreConfigs = 'app', 'auth', 'broadcasting', 'cache', 'database', 'filesystems', 'hashing',
-               'logging', 'mail', 'queue', 'services', 'session', 'view'
-$configDir = Join-Path $Repo 'config'
-$configProblems = 0
-foreach ($name in $coreConfigs) {
-    $target = Join-Path $configDir "$name.php"
-    if (Test-Path $target) { continue }
-    $configProblems++
-    $rel = "config/$name.php"
-
-    # 1) tracked in git and deleted from the working tree -> restore the committed copy
-    $tracked = git -C $Repo ls-files -- $rel 2>$null
-    if ($tracked) {
-        if ($NoFix) { Add-Result 'FAIL' $rel "missing (tracked in git - restore with: git checkout -- $rel)"; continue }
-        git -C $Repo checkout -- $rel 2>$null
-        if (Test-Path $target) { Add-Result 'FIX' $rel 'was deleted - restored from git'; continue }
-    }
-
-    # 2) a local template next to it
-    $templates = @(Get-ChildItem $configDir -File -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -like "${name}_*.php" -or $_.Name -eq "$name.example.php" -or
-        $_.Name -eq "$name.php.example" -or $_.Name -eq "$name.php.dist" })
-    if ($templates.Count -eq 1) {
-        if ($NoFix) { Add-Result 'FAIL' $rel "missing (restore: copy config\$($templates[0].Name))" }
-        else {
-            Copy-Item $templates[0].FullName $target
-            Add-Result 'FIX' $rel "was missing - copied from config\$($templates[0].Name)"
+    $script:envLines = @()
+    if (Test-Path $envPath) {
+        $bytes  = [IO.File]::ReadAllBytes($envPath)
+        $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+        $text   = (New-Object Text.UTF8Encoding $false).GetString($bytes)
+        if ($hasBom) { $text = $text.Substring(1) }
+        $lines = $text -split "`n"             # each line keeps its trailing `r
+        $bad = @()
+        for ($i = 0; $i -lt $lines.Length; $i++) {
+            $t = $lines[$i].Trim()
+            if ($t -ne '' -and -not $t.StartsWith('#') -and -not $t.Contains('=')) { $bad += $i }
         }
-    } elseif ($templates.Count -gt 1) {
-        Add-Result 'FAIL' $rel "missing - several templates, pick one and copy it: $(($templates | ForEach-Object Name) -join ', ')"
-    } else {
-        Add-Result 'FAIL' $rel 'missing and no template found - ask a teammate for their copy'
+        if ($bad.Count -gt 0) {
+            $desc = ($bad | ForEach-Object { "line $($_ + 1): `"$($lines[$_].Trim())`"" }) -join '; '
+            if ($NoFix) {
+                Add-Result 'FAIL' '.env' "missing # on $desc"
+            } else {
+                Copy-Item $envPath "$envPath.bak-$Stamp"
+                foreach ($i in $bad) { $lines[$i] = '# ' + $lines[$i].TrimStart() }
+                [IO.File]::WriteAllText($envPath, ($lines -join "`n"), (New-Object Text.UTF8Encoding $hasBom))
+                Add-Result 'FIX' '.env' "added # to $desc (backup .env.bak-$Stamp)"
+            }
+        } elseif (-not $envFixed) {
+            Add-Result 'OK' '.env' 'present, no broken lines'
+        }
+        $script:envLines = Get-Content $envPath
     }
-}
-if ($configProblems -eq 0) { Add-Result 'OK' 'config' 'all core config files present' }
+    $envLines = $script:envLines
 
-# ---------------------------------------------------------------- runtime folders
-$dirs = 'storage\app', 'storage\framework\cache', 'storage\framework\sessions',
-        'storage\framework\views', 'storage\logs', 'bootstrap\cache'
-$missingDirs = @($dirs | Where-Object { -not (Test-Path (Join-Path $Repo $_)) })
-if ($missingDirs.Count -eq 0) {
-    Add-Result 'OK' 'folders' 'storage and bootstrap\cache folders present'
-} elseif ($NoFix) {
-    Add-Result 'FAIL' 'folders' "missing: $($missingDirs -join ', ')"
-} else {
-    foreach ($d in $missingDirs) { New-Item -ItemType Directory -Force (Join-Path $Repo $d) | Out-Null }
-    Add-Result 'FIX' 'folders' "created: $($missingDirs -join ', ')"
-}
+    # ------------------------------------------------------------ core config files
+    $coreConfigs = 'app', 'auth', 'broadcasting', 'cache', 'database', 'filesystems', 'hashing',
+                   'logging', 'mail', 'queue', 'services', 'session', 'view'
+    $configDir = Join-Path $Repo 'config'
+    $configProblems = 0
+    foreach ($name in $coreConfigs) {
+        $target = Join-Path $configDir "$name.php"
+        if (Test-Path $target) { continue }
+        $configProblems++
+        $rel = "config/$name.php"
 
-# ---------------------------------------------------------------- stale bootstrap cache
-$cacheDir   = Join-Path $Repo 'bootstrap\cache'
-$cacheFiles = @('config.php', 'routes-v7.php', 'routes.php', 'services.php') |
-              Where-Object { Test-Path (Join-Path $cacheDir $_) }
+        # 1) tracked in git and deleted from the working tree -> restore the committed copy
+        $tracked = git -C $Repo ls-files -- $rel 2>$null
+        if ($tracked) {
+            if ($NoFix) { Add-Result 'FAIL' $rel "missing (tracked in git - restore with: git checkout -- $rel)"; continue }
+            git -C $Repo checkout -- $rel 2>$null
+            if (Test-Path $target) { Add-Result 'FIX' $rel 'was deleted - restored from git'; continue }
+        }
 
-function Find-MissingClasses($file) {
-    $path = Join-Path $cacheDir $file
-    if (-not (Test-Path $path)) { return @() }
-    $text    = [IO.File]::ReadAllText($path)
-    $pattern = 'App\\{1,2}(?:Providers|Http\\{1,2}Controllers)\\{1,2}[A-Za-z0-9_\\]*[A-Za-z0-9_]'
-    $classes = [regex]::Matches($text, $pattern) | ForEach-Object { $_.Value -replace '\\\\', '\' } | Sort-Object -Unique
-    $missing = @()
-    foreach ($c in $classes) {
-        if (-not (Test-Path (Join-Path $Repo (($c -replace '^App\\', 'app\') + '.php')))) { $missing += $c }
-    }
-    return $missing
-}
-
-if ($cacheFiles.Count -eq 0) {
-    Add-Result 'OK' 'bootstrap cache' 'not cached (Laravel reads source)'
-} else {
-    $missing = @()
-    foreach ($f in $cacheFiles) { $missing += Find-MissingClasses $f }
-    $missing = @($missing | Sort-Object -Unique)
-    if ($missing.Count -eq 0) {
-        Add-Result 'OK' 'bootstrap cache' 'all cached classes exist'
-    } else {
-        $names = ($missing | Select-Object -First 3 | ForEach-Object { $_.Split('\')[-1] }) -join ', '
-        if ($missing.Count -gt 3) { $names += " (+$($missing.Count - 3) more)" }
-        if ($NoFix) {
-            Add-Result 'FAIL' 'bootstrap cache' "stale - references missing $names"
+        # 2) a local template next to it
+        $templates = @(Get-ChildItem $configDir -File -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -like "${name}_*.php" -or $_.Name -eq "$name.example.php" -or
+            $_.Name -eq "$name.php.example" -or $_.Name -eq "$name.php.dist" })
+        if ($templates.Count -eq 1) {
+            if ($NoFix) { Add-Result 'FAIL' $rel "missing (restore: copy config\$($templates[0].Name))" }
+            else {
+                Copy-Item $templates[0].FullName $target
+                Add-Result 'FIX' $rel "was missing - copied from config\$($templates[0].Name)"
+            }
+        } elseif ($templates.Count -gt 1) {
+            Add-Result 'FAIL' $rel "missing - several templates, pick one and copy it: $(($templates | ForEach-Object Name) -join ', ')"
         } else {
-            $dest = Join-Path $cacheDir "_stale\$Stamp"
-            New-Item -ItemType Directory -Force $dest | Out-Null
-            foreach ($f in $cacheFiles) { Move-Item (Join-Path $cacheDir $f) $dest }
-            Add-Result 'FIX' 'bootstrap cache' "stale ($names) - moved $($cacheFiles -join ', ') to bootstrap\cache\_stale\$Stamp"
+            Add-Result 'FAIL' $rel 'missing and no template found - ask a teammate for their copy'
         }
     }
-}
+    if ($configProblems -eq 0) { Add-Result 'OK' 'config' 'all core config files present' }
 
-# ================================================================ SETUP CHECKS (full mode only)
-if (-not $Quick) {
+    # ------------------------------------------------------------ runtime folders
+    $dirs = 'storage\app', 'storage\framework\cache', 'storage\framework\sessions',
+            'storage\framework\views', 'storage\logs', 'bootstrap\cache'
+    $missingDirs = @($dirs | Where-Object { -not (Test-Path (Join-Path $Repo $_)) })
+    if ($missingDirs.Count -eq 0) {
+        Add-Result 'OK' 'folders' 'storage and bootstrap\cache folders present'
+    } elseif ($NoFix) {
+        Add-Result 'FAIL' 'folders' "missing: $($missingDirs -join ', ')"
+    } else {
+        foreach ($d in $missingDirs) { New-Item -ItemType Directory -Force (Join-Path $Repo $d) | Out-Null }
+        Add-Result 'FIX' 'folders' "created: $($missingDirs -join ', ')"
+    }
+
+    # ------------------------------------------------------------ stale bootstrap cache
+    $cacheDir   = Join-Path $Repo 'bootstrap\cache'
+    $cacheFiles = @('config.php', 'routes-v7.php', 'routes.php', 'services.php') |
+                  Where-Object { Test-Path (Join-Path $cacheDir $_) }
+    if ($cacheFiles.Count -eq 0) {
+        Add-Result 'OK' 'bootstrap cache' 'not cached (Laravel reads source)'
+    } else {
+        $pattern = 'App\\{1,2}(?:Providers|Http\\{1,2}Controllers)\\{1,2}[A-Za-z0-9_\\]*[A-Za-z0-9_]'
+        $missing = @()
+        foreach ($f in $cacheFiles) {
+            $text = [IO.File]::ReadAllText((Join-Path $cacheDir $f))
+            $classes = [regex]::Matches($text, $pattern) | ForEach-Object { $_.Value -replace '\\\\', '\' } | Sort-Object -Unique
+            foreach ($c in $classes) {
+                if (-not (Test-Path (Join-Path $Repo (($c -replace '^App\\', 'app\') + '.php')))) { $missing += $c }
+            }
+        }
+        $missing = @($missing | Sort-Object -Unique)
+        if ($missing.Count -eq 0) {
+            Add-Result 'OK' 'bootstrap cache' 'all cached classes exist'
+        } else {
+            $names = ($missing | Select-Object -First 3 | ForEach-Object { $_.Split('\')[-1] }) -join ', '
+            if ($missing.Count -gt 3) { $names += " (+$($missing.Count - 3) more)" }
+            if ($NoFix) {
+                Add-Result 'FAIL' 'bootstrap cache' "stale - references missing $names"
+            } else {
+                $dest = Join-Path $cacheDir "_stale\$Stamp"
+                New-Item -ItemType Directory -Force $dest | Out-Null
+                foreach ($f in $cacheFiles) { Move-Item (Join-Path $cacheDir $f) $dest }
+                Add-Result 'FIX' 'bootstrap cache' "stale ($names) - moved $($cacheFiles -join ', ') to bootstrap\cache\_stale\$Stamp"
+            }
+        }
+    }
+
+    if ($Quick) { return }
+
+    # ------------------------------------------------------------ vendor / APP_KEY / Passport
     $composer = $null
     $composerPath = Join-Path $Repo 'composer.json'
     if (Test-Path $composerPath) { $composer = Get-Content $composerPath -Raw | ConvertFrom-Json }
-
-    # ------------------------------------------------------------ vendor / APP_KEY / Passport
     if (-not (Test-Path (Join-Path $Repo 'vendor\autoload.php'))) {
         Add-Result 'FAIL' 'vendor' 'not installed - run: composer install'
     }
@@ -278,11 +302,10 @@ if (-not $Quick) {
         Add-Result 'INFO' 'database' "REMOTE $dbHost`:$dbPort / $dbName (not tested - local only)"
     } else {
         $label = "database $dbPort"
-        $listener = Get-NetTCPConnection -LocalPort ([int]$dbPort) -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-        $servers  = @(Get-Process mysqld, mariadbd -ErrorAction SilentlyContinue)
+        $srv = Get-Listener $dbPort
+        $servers = @(Get-Process mysqld, mariadbd -ErrorAction SilentlyContinue)
 
-        if ($listener) {
-            $srv = Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue
+        if (Test-Listening $dbPort) {
             $where = ''
             if ($srv -and $srv.Path) { $where = " ($($srv.Path))" }
             if (-not $php) {
@@ -323,15 +346,14 @@ try {
                 }
             }
         } elseif ($servers.Count -gt 0) {
-            $s = $servers[0]
-            $ports = Get-ListenPorts $s.Id
+            $ports = Get-ListenPorts $servers[0].Id
             if ($ports.Count -gt 0) {
                 Add-Result 'FAIL' $label "MySQL is running but on port $($ports -join ', '), while .env says DB_PORT=$dbPort"
             } else {
                 Add-Result 'WARN' $label 'MySQL is starting - probably crash recovery. Wait 1-2 minutes, do not kill it'
             }
         } else {
-            # not running: find the newest error log of any local install
+            # not running: read the newest error log of any local install
             $hint = 'MySQL is not running - start it (XAMPP / Laragon / WAMP control panel)'
             $logs = @()
             foreach ($pat in 'C:\xampp*\mysql\data', 'C:\laragon\data\mysql*', 'C:\wamp64\bin\mysql\*\data',
@@ -363,14 +385,11 @@ try {
     $web = @()
     foreach ($p in @(Get-Process httpd, nginx, php, php-cgi, caddy -ErrorAction SilentlyContinue)) {
         $ports = Get-ListenPorts $p.Id
-        if ($ports.Count -gt 0) {
-            $web += [pscustomobject]@{ Name = $p.ProcessName; Ports = ($ports -join ', '); Path = $p.Path }
-        }
+        if ($ports.Count -gt 0) { $web += [pscustomobject]@{ Name = $p.ProcessName; Ports = ($ports -join ', ') } }
     }
     $web = @($web | Sort-Object Name, Ports -Unique)
     if ($web.Count -gt 0) {
-        $desc = ($web | ForEach-Object { "$($_.Name) on :$($_.Ports)" }) -join '; '
-        Add-Result 'OK' 'web server' $desc
+        Add-Result 'OK' 'web server' (($web | ForEach-Object { "$($_.Name) on :$($_.Ports)" }) -join '; ')
     } else {
         $hint = 'none running - start Apache (XAMPP/Laragon) or: php artisan serve'
         $bat = Get-ChildItem $Repo -Filter 'start-apache.bat' -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -396,19 +415,214 @@ try {
     }
 }
 
-# ================================================================ OUTPUT
-$problems = @($results | Where-Object { $_.Status -ne 'OK' -and $_.Status -ne 'INFO' })
-if ($Quick -and $problems.Count -eq 0) { exit 0 }
+# ================================================================ REACT
 
-$branch = (git -C $Repo rev-parse --abbrev-ref HEAD 2>$null)
-Write-Host ''
-Write-Host "Doctor - $Repo  (branch: $branch)" -ForegroundColor Cyan
-$colors = @{ OK = 'Green'; INFO = 'Cyan'; FIX = 'Yellow'; WARN = 'Yellow'; FAIL = 'Red' }
-foreach ($r in $results) {
-    if ($Quick -and ($r.Status -eq 'OK' -or $r.Status -eq 'INFO')) { continue }
-    Write-Host ('[{0,-4}] ' -f $r.Status) -ForegroundColor $colors[$r.Status] -NoNewline
-    Write-Host ('{0,-20} {1}' -f $r.Name, $r.Msg)
+function Test-React {
+    $pkg = Get-Content (Join-Path $Repo 'package.json') -Raw | ConvertFrom-Json
+    $allDeps = @{}
+    foreach ($section in @($pkg.dependencies, $pkg.devDependencies)) {
+        if ($section) { foreach ($p in $section.PSObject.Properties) { $allDeps[$p.Name] = $p.Value } }
+    }
+    $isVite = $allDeps.ContainsKey('vite')
+
+    # ------------------------------------------------------------ env files
+    $envOrder = '.env.development.local', '.env.local', '.env.development', '.env'   # npm start priority
+    $present = @($envOrder | Where-Object { Test-Path (Join-Path $Repo $_) })
+    if ($present.Count -eq 0) {
+        $tpl = @('.env.development.example', '.env.example', '.env.sample', '.env.dist',
+                 '.env.development.copy', '.env.copy') | Where-Object { Test-Path (Join-Path $Repo $_) } | Select-Object -First 1
+        if ($tpl) {
+            $target = $tpl -replace '\.(example|sample|dist|copy)$', ''
+            if ($NoFix) {
+                Add-Result 'FAIL' 'env file' "none found (copy $tpl to $target)"
+            } else {
+                Copy-Item (Join-Path $Repo $tpl) (Join-Path $Repo $target)
+                Add-Result 'FIX' 'env file' "none found - copied $tpl to $target. Check the values inside"
+                $present = @($target)
+            }
+        } else {
+            Add-Result 'WARN' 'env file' 'none found and no template - ask a teammate for their .env.development'
+        }
+    } else {
+        Add-Result 'OK' 'env file' ($present -join ', ')
+    }
+
+    # effective values: the first file in priority order wins; inside one file the last line wins
+    $effective = @{}
+    $dupes = @()
+    foreach ($name in $envOrder) {
+        $file = Join-Path $Repo $name
+        if (-not (Test-Path $file)) { continue }
+        $vals = @{}
+        foreach ($l in Get-Content $file) {
+            if ($l -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$') {
+                $k = $Matches[1]; $v = $Matches[2].Trim('"', "'")
+                if ($vals.ContainsKey($k) -and $vals[$k] -ne $v) { $dupes += "$k in $name" }
+                $vals[$k] = $v
+            }
+        }
+        foreach ($k in $vals.Keys) {
+            if (-not $effective.ContainsKey($k)) { $effective[$k] = @{ Value = $vals[$k]; File = $name } }
+        }
+    }
+    if ($dupes.Count -gt 0) {
+        Add-Result 'WARN' 'env duplicates' "set twice with different values (the LAST line wins): $(($dupes | Select-Object -Unique) -join '; ')"
+    }
+
+    # ------------------------------------------------------------ node_modules up to date?
+    $pm = 'npm'
+    if (Test-Path (Join-Path $Repo 'yarn.lock')) { $pm = 'yarn' }
+    if (Test-Path (Join-Path $Repo 'pnpm-lock.yaml')) { $pm = 'pnpm' }
+    if ((Test-Path (Join-Path $Repo 'yarn.lock')) -and (Test-Path (Join-Path $Repo 'package-lock.json'))) {
+        Add-Result 'WARN' 'lock files' 'both package-lock.json and yarn.lock exist - the team should use one'
+    }
+    $node = Get-Command node -ErrorAction SilentlyContinue | Select-Object -First 1
+
+    if (-not (Test-Path (Join-Path $Repo 'node_modules'))) {
+        Add-Result 'FAIL' 'packages' "node_modules missing - run: $pm install"
+    } elseif ($node) {
+        $probe = Join-Path $env:TEMP 'doctor-deps-probe.js'
+        Set-Content $probe -Encoding ASCII -Value @'
+const fs = require('fs'), path = require('path');
+const root = process.argv[2];
+const read = f => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { return null; } };
+const pkg = read(path.join(root, 'package.json')) || {};
+const lock = read(path.join(root, 'package-lock.json'));
+const deps = Object.assign({}, pkg.dependencies, pkg.devDependencies);
+const out = [];
+for (const n of Object.keys(deps)) {
+  const inst = read(path.join(root, 'node_modules', n, 'package.json'));
+  if (!inst) { out.push(n + ' (not installed)'); continue; }
+  let want = null;
+  if (lock && lock.packages && lock.packages['node_modules/' + n]) want = lock.packages['node_modules/' + n].version;
+  else if (lock && lock.dependencies && lock.dependencies[n]) want = lock.dependencies[n].version;
+  if (want && want !== inst.version) out.push(n + ' ' + inst.version + ' -> ' + want);
 }
-Write-Host ''
-if (@($results | Where-Object { $_.Status -eq 'FAIL' }).Count -gt 0) { exit 1 }
+console.log(out.join('\n'));
+'@
+        $oldEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        $stale = @(& $node.Source $probe $Repo 2>&1 | ForEach-Object { "$_" } | Where-Object { $_.Trim() -ne '' })
+        $ErrorActionPreference = $oldEap
+        if ($stale.Count -eq 0) {
+            Add-Result 'OK' 'packages' 'node_modules matches package-lock'
+        } else {
+            $list = ($stale | Select-Object -First 3) -join '; '
+            if ($stale.Count -gt 3) { $list += " (+$($stale.Count - 3) more)" }
+            Add-Result 'WARN' 'packages' "out of date after a branch switch? run: $pm install  [$list]"
+        }
+    }
+
+    if ($Quick) { return }
+
+    # ------------------------------------------------------------ Node version
+    if (-not $node) {
+        Add-Result 'FAIL' 'node' 'Node.js not found - install it (or nvm-windows)'
+    } else {
+        $ver = (& $node.Source -v).Trim()
+        $major = [int](($ver -replace '^v', '').Split('.')[0])
+        $wanted = $null
+        foreach ($f in '.nvmrc', '.node-version') {
+            $fp = Join-Path $Repo $f
+            if (Test-Path $fp) { $wanted = (Get-Content $fp -TotalCount 1).Trim(); break }
+        }
+        if (-not $wanted -and $pkg.engines -and $pkg.engines.node) { $wanted = $pkg.engines.node }
+
+        $rs = $null
+        if ($allDeps.ContainsKey('react-scripts') -and ($allDeps['react-scripts'] -match '(\d+)')) { $rs = [int]$Matches[1] }
+
+        if ($rs -and $rs -lt 5 -and $major -ge 17) {
+            Add-Result 'FAIL' 'node' "Node $ver is too new for react-scripts $rs (npm start fails with ERR_OSSL_EVP_UNSUPPORTED) - use Node 16, or set NODE_OPTIONS=--openssl-legacy-provider"
+        } elseif ($wanted -and ($wanted -match '(\d+)') -and ([int]$Matches[1] -ne $major) -and ($wanted -notmatch '[<>^~|]')) {
+            Add-Result 'WARN' 'node' "$ver, but the project wants $wanted"
+        } else {
+            $msg = "$ver ($($node.Source))"
+            if ($wanted) { $msg += " (project wants $wanted)" }
+            Add-Result 'INFO' 'node' $msg
+        }
+    }
+
+    # ------------------------------------------------------------ which backend does the FE call?
+    $urlKeys = @($effective.Keys | Where-Object {
+        $_ -match '^(REACT_APP|VITE)_\w*(BASE_URL|API_URL|API_BASE|BACKEND_URL|SERVER_URL)$' -and
+        $effective[$_].Value -match '^https?://' } | Sort-Object)
+    if ($urlKeys.Count -eq 0) {
+        Add-Result 'INFO' 'backend URL' 'no REACT_APP_*/VITE_* URL setting found'
+    }
+    foreach ($k in $urlKeys) {
+        $url = $effective[$k].Value
+        $src = $effective[$k].File
+        $uri = $null
+        try { $uri = [Uri]$url } catch { }
+        if (-not $uri) { Add-Result 'WARN' $k "not a valid URL: $url ($src)"; continue }
+        if ($uri.Host -eq 'localhost' -or $uri.Host -eq '127.0.0.1') {
+            $owner = Get-Listener $uri.Port
+            if (Test-Listening $uri.Port) {
+                $who = ''
+                if ($owner) { $who = " - $($owner.ProcessName) is listening" }
+                Add-Result 'OK' $k "$url ($src)$who"
+            } else {
+                Add-Result 'FAIL' $k "$url ($src) - nothing is listening on port $($uri.Port). Start the backend, or fix the port"
+            }
+        } else {
+            Add-Result 'INFO' $k "REMOTE $url ($src)"
+        }
+    }
+
+    # ------------------------------------------------------------ dev server
+    $port = 3000
+    if ($isVite) { $port = 5173 }
+    if ($effective.ContainsKey('PORT') -and $effective['PORT'].Value -match '^\d+$') { $port = [int]$effective['PORT'].Value }
+    if (Test-Listening $port) { Add-Result 'INFO' 'dev server' "running on :$port" }
+    else                      { Add-Result 'INFO' 'dev server' "not running on :$port (start with: $pm start)" }
+}
+
+# ================================================================ which projects to check
+
+$targets = @()
+if ($Path) {
+    $targets = @($Path)
+} else {
+    $here = (Get-Location).Path
+    $top = git -C $here rev-parse --show-toplevel 2>$null
+    if ($top) { $top = $top -replace '/', '\' }
+    if (-not $All -and (Get-ProjectType $here)) { $targets = @($here) }
+    elseif (-not $All -and $top -and (Get-ProjectType $top)) { $targets = @($top) }
+    elseif (Test-Path $ProjectsFile) {
+        $targets = @(Get-Content $ProjectsFile | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
+    }
+}
+if ($targets.Count -eq 0) {
+    Write-Host 'No project to check. Run doctor inside a project folder, or run install.cmd to register your projects.' -ForegroundColor Yellow
+    exit 1
+}
+
+$anyFail = $false
+$printed = $false
+$colors = @{ OK = 'Green'; INFO = 'Cyan'; FIX = 'Yellow'; WARN = 'Yellow'; FAIL = 'Red' }
+foreach ($Repo in $targets) {
+    $script:results = New-Object System.Collections.ArrayList
+    $type = Get-ProjectType $Repo
+    if     ($type -eq 'Laravel') { Test-Laravel }
+    elseif ($type -eq 'React')   { Test-React }
+    else {
+        Add-Result 'FAIL' 'project' 'not found, or not a Laravel/React project'
+    }
+
+    if (@($results | Where-Object { $_.Status -eq 'FAIL' }).Count -gt 0) { $anyFail = $true }
+    $problems = @($results | Where-Object { $_.Status -ne 'OK' -and $_.Status -ne 'INFO' })
+    if ($Quick -and $problems.Count -eq 0) { continue }
+
+    $branch = ''
+    if ($type) { $branch = (git -C $Repo rev-parse --abbrev-ref HEAD 2>$null) }
+    $printed = $true
+    Write-Host ''
+    Write-Host "Doctor - $Repo  [$type]  (branch: $branch)" -ForegroundColor Cyan
+    foreach ($r in $results) {
+        if ($Quick -and ($r.Status -eq 'OK' -or $r.Status -eq 'INFO')) { continue }
+        Write-Host ('[{0,-4}] ' -f $r.Status) -ForegroundColor $colors[$r.Status] -NoNewline
+        Write-Host ('{0,-20} {1}' -f $r.Name, $r.Msg)
+    }
+}
+if ($printed) { Write-Host '' }
+if ($anyFail) { exit 1 }
 exit 0

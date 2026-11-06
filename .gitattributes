@@ -1,0 +1,2 @@
+# the Git Bash launcher must keep LF line endings, or bash fails on "#!/bin/sh\r"
+doctor text eol=lf
